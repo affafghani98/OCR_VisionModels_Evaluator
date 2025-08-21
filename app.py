@@ -22,8 +22,8 @@ if not GROQ_API_KEY:
 groq = Groq(api_key=GROQ_API_KEY)
 easy_reader = easyocr.Reader(["en"], gpu=False)
 
-# 🔑 Unified OCR prompt (strict extraction)
-VISION_PROMPT = (
+# Strict OCR prompt for Groq models
+VISION_PROMPT_GROQ = (
     "You are an OCR assistant. "
     "Extract **all visible text** from the image exactly as shown. "
     "Do not summarize. Do not explain. "
@@ -31,6 +31,15 @@ VISION_PROMPT = (
     "If the image contains diagrams, graphs, or charts with text, extract all labels and numbers. "
     "Return only the raw extracted text."
 )
+
+# More general prompt for Ollama local models
+VISION_PROMPT_OLLAMA = (
+    "You are a vision-language assistant. "
+    "Extract as much text as you can from the image, including tables, labels, and numbers. "
+    "Return the text in a clear format. "
+    "If you cannot extract text from certain areas, skip them gracefully."
+)
+
 
 # ---------------- Engines ----------------
 ENGINE_CHOICES = {
@@ -47,8 +56,6 @@ ENGINE_CHOICES = {
     "Granite 3.2 Vision (2B, Local)": ("local_llama", "granite3.2-vision:2b"),
 }
 
-
-
 def process_with_engine(img_bytes, engine):
     kind, name = ENGINE_CHOICES[engine]
     
@@ -63,15 +70,15 @@ def process_with_engine(img_bytes, engine):
         )
 
     elif kind == "groq":
-        # Groq vision models
+        # Groq vision models use strict OCR prompt
         uri = "data:image/png;base64," + base64.b64encode(img_bytes).decode()
         resp = groq.chat.completions.create(
             model=name,
             messages=[
-                {"role": "system", "content": VISION_PROMPT},
+                {"role": "system", "content": VISION_PROMPT_GROQ},
                 {"role": "user", "content": [
-                    {"type": "text", "text": VISION_PROMPT},
-                    {"type": "image_url", "image_url": {"url": uri}},
+                    {"type": "text", "text": VISION_PROMPT_GROQ},
+                    {"type": "image_url", "image_url": {"url": uri}}  
                 ]},
             ],
             temperature=0
@@ -79,10 +86,11 @@ def process_with_engine(img_bytes, engine):
         return resp.choices[0].message.content.strip()
     
     elif kind == "local_llama":
-        return send_to_local_llama(img_bytes, name, VISION_PROMPT)
+        # Ollama local models use the alternative prompt
+        return send_to_local_llama(img_bytes, name, VISION_PROMPT_OLLAMA)
 
 
-def send_to_local_llama(img_bytes: bytes, model_name: str, prompt: str = VISION_PROMPT) -> str:
+def send_to_local_llama(img_bytes: bytes, model_name: str, prompt: str = VISION_PROMPT_OLLAMA) -> str:
     try:
         image_base64 = base64.b64encode(img_bytes).decode("utf-8")
         payload = {
