@@ -8,7 +8,7 @@ __pycache__/
 *.log
 
 # Virtual Environment
-ven/
+even/
 .env
 .env.*
 

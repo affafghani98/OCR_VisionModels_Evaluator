@@ -1,0 +1,14 @@
+
+
+# Core Dependencies - Install FIRST to avoid conflicts
+# These must be installed before other packages to prevent version conflicts
+
+# Core ML/Image Processing Libraries
+numpy>=1.24.4,<2.0
+opencv-python-headless==4.10.0.84
+protobuf>=3.20.0,<4.0
+
+# OCR Libraries
+easyocr==1.7.2
+paddlepaddle>=3.0.0
+paddleocr>=3.0.0

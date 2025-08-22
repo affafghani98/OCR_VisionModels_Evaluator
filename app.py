@@ -5,6 +5,7 @@ from dotenv import load_dotenv
 from PIL import Image, ImageEnhance
 import pytesseract
 import easyocr
+from paddleocr import PaddleOCR
 from groq import Groq
 
 # ---------------- Setup ----------------
@@ -25,6 +26,7 @@ if not GROQ_API_KEY:
 
 groq = Groq(api_key=GROQ_API_KEY)
 easy_reader = easyocr.Reader(["en"], gpu=False)
+paddle_reader = PaddleOCR(use_angle_cls=True, lang="en")
 
 DEFAULT_PROMPT = (
     "You are a vision-language assistant. "
@@ -39,6 +41,7 @@ DEFAULT_PROMPT = (
 ENGINE_CHOICES = {
     "Tesseract (OCR)": ("ocr", "tesseract"),
     "EasyOCR (OCR)": ("ocr", "easyocr"),
+    "PaddleOCR (OCR)": ("ocr", "paddleocr"),
 
     # Groq-hosted models
     "LLaMA 4 Scout (Vision Model - Groq)": ("groq", "meta-llama/llama-4-scout-17b-16e-instruct"),
@@ -51,6 +54,68 @@ ENGINE_CHOICES = {
 }
 
 
+def extract_text_from_item(item):
+    """Helper function to extract text from various item formats"""
+    if isinstance(item, str):
+        return item.strip()
+    elif isinstance(item, dict):
+        text_keys = ['text', 'rec_text', 'recognized_text', 'content', 'transcription']
+        for key in text_keys:
+            if key in item and item[key]:
+                return str(item[key]).strip()
+    elif isinstance(item, (list, tuple)) and len(item) >= 2:
+        # Legacy format [bbox, [text, confidence]]
+        if isinstance(item[1], (list, tuple)) and len(item[1]) > 0:
+            return str(item[1][0]).strip()
+        elif isinstance(item[1], str):
+            return item[1].strip()
+    return None
+
+
+def deep_extract_text(obj, max_depth=3, current_depth=0):
+    """Recursively extract any text-like content from nested structures"""
+    text_lines = []
+    
+    if current_depth > max_depth:
+        return text_lines
+    
+    if isinstance(obj, str) and len(obj.strip()) > 0 and not obj.startswith('array'):
+        text_lines.append(obj.strip())
+    elif isinstance(obj, dict):
+        for key, value in obj.items():
+            if isinstance(value, str) and len(value.strip()) > 0 and not value.startswith('array'):
+                text_lines.append(value.strip())
+            elif isinstance(value, (dict, list)):
+                text_lines.extend(deep_extract_text(value, max_depth, current_depth + 1))
+    elif isinstance(obj, list):
+        for item in obj:
+            text_lines.extend(deep_extract_text(item, max_depth, current_depth + 1))
+    
+    return text_lines
+
+
+def analyze_result_structure(result, max_depth=2):
+    """Analyze the structure of the result for debugging"""
+    def analyze_item(obj, depth=0, max_d=2):
+        if depth > max_d:
+            return "..."
+        
+        if isinstance(obj, dict):
+            keys = list(obj.keys())[:5]  # Show first 5 keys
+            return f"dict({keys}...)" if len(obj) > 5 else f"dict({keys})"
+        elif isinstance(obj, list):
+            if len(obj) > 0:
+                return f"list[{len(obj)}]({analyze_item(obj[0], depth+1, max_d)})"
+            else:
+                return "list[0]"
+        elif isinstance(obj, str):
+            return f"str('{obj[:30]}...')" if len(obj) > 30 else f"str('{obj}')"
+        else:
+            return str(type(obj).__name__)
+    
+    return analyze_item(result)
+
+
 def process_with_engine(img_bytes, engine, user_prompt):
     kind, name = ENGINE_CHOICES[engine]
     logging.info(f"▶ Using engine: {engine} ({kind} - {name})")
@@ -61,8 +126,108 @@ def process_with_engine(img_bytes, engine, user_prompt):
         img = ImageEnhance.Contrast(img.convert("L")).enhance(2.0)
         if name == "tesseract":
             return pytesseract.image_to_string(img)
-        else:
+        elif name == "easyocr":
             return " ".join(easy_reader.readtext(np.array(img), detail=0, paragraph=True))
+        elif name == "paddleocr":
+            try:
+                # Use original RGB image without contrast enhancement for PaddleOCR
+                img_original = Image.open(io.BytesIO(img_bytes)).convert('RGB')
+                img_array = np.array(img_original)
+                
+                # Ensure image has correct shape (H, W, C)
+                if len(img_array.shape) == 2:
+                    img_array = np.expand_dims(img_array, axis=2)
+                    img_array = np.repeat(img_array, 3, axis=2)
+                elif img_array.shape[2] == 4:  # RGBA to RGB
+                    img_array = img_array[:,:,:3]
+                
+                logging.info(f"PaddleOCR processing image with shape: {img_array.shape}")
+                
+                # Try both predict and ocr methods
+                result = None
+                try:
+                    result = paddle_reader.predict(img_array)
+                    logging.info(f"PaddleOCR predict result type: {type(result)}")
+                except Exception as predict_error:
+                    logging.warning(f"Predict failed, trying ocr: {predict_error}")
+                    try:
+                        result = paddle_reader.ocr(img_array)
+                        logging.info(f"PaddleOCR ocr result type: {type(result)}")
+                    except Exception as ocr_error:
+                        logging.error(f"Both predict and ocr failed: {ocr_error}")
+                        return f"❌ PaddleOCR API error: {str(ocr_error)}"
+                
+                if not result:
+                    return "No text detected by PaddleOCR (empty result)"
+                
+                text_lines = []
+                
+                # Handle the specific PaddleOCR structure we see
+                try:
+                    logging.info(f"Processing result of type: {type(result)}, length: {len(result) if hasattr(result, '__len__') else 'N/A'}")
+                    
+                    # The result is a list of dictionaries with nested structure
+                    for item in result:
+                        if isinstance(item, dict):
+                            # Look for OCR results in various possible keys
+                            ocr_keys_to_check = ['ocr_res', 'text_detection', 'text_recognition', 'predictions', 'results']
+                            
+                            for key in ocr_keys_to_check:
+                                if key in item:
+                                    ocr_results = item[key]
+                                    logging.info(f"Found OCR results in key '{key}': {type(ocr_results)}")
+                                    
+                                    if isinstance(ocr_results, list):
+                                        for ocr_item in ocr_results:
+                                            text_content = extract_text_from_item(ocr_item)
+                                            if text_content:
+                                                text_lines.append(text_content)
+                                                logging.info(f"Extracted text: {text_content}")
+                            
+                            # Also check if there are direct text fields
+                            direct_text_keys = ['text', 'rec_text', 'recognized_text', 'content']
+                            for key in direct_text_keys:
+                                if key in item and item[key]:
+                                    text_content = str(item[key]).strip()
+                                    if text_content:
+                                        text_lines.append(text_content)
+                                        logging.info(f"Found direct text via '{key}': {text_content}")
+                            
+                            # Check for nested structures
+                            if 'doc_preprocessor_res' in item:
+                                doc_res = item['doc_preprocessor_res']
+                                if isinstance(doc_res, dict):
+                                    # Look for text in document preprocessor results
+                                    for nested_key in ['text', 'ocr_results', 'recognized_text']:
+                                        if nested_key in doc_res and doc_res[nested_key]:
+                                            text_content = str(doc_res[nested_key]).strip()
+                                            if text_content:
+                                                text_lines.append(text_content)
+                                                logging.info(f"Found text in doc_preprocessor_res['{nested_key}']: {text_content}")
+                    
+                    logging.info(f"Total text lines found: {len(text_lines)}")
+                    
+                    # If no text found with above methods, let's try to extract from any string-like values
+                    if not text_lines:
+                        logging.info("No text found with standard methods, trying deep extraction...")
+                        text_lines = deep_extract_text(result)
+                    
+                except Exception as parse_error:
+                    logging.error(f"Error parsing PaddleOCR result: {parse_error}")
+                    return f"PaddleOCR result parsing error: {str(parse_error)}"
+                
+                if text_lines:
+                    final_result = "\n".join(text_lines)
+                    logging.info(f"Final PaddleOCR result: {final_result}")
+                    return final_result
+                else:
+                    # Return structure info for debugging
+                    structure_info = analyze_result_structure(result)
+                    return f"No text extracted. Structure analysis:\n{structure_info}"
+                
+            except Exception as e:
+                logging.error(f"❌ PaddleOCR error: {e}")
+                return f"❌ PaddleOCR error: {str(e)}"
 
     elif kind == "groq":
         uri = "data:image/png;base64," + base64.b64encode(img_bytes).decode()
